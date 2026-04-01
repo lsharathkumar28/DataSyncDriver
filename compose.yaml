@@ -1,0 +1,74 @@
+# =============================================================================
+# DataSyncDriver — Docker Compose
+#
+# Runs two driver instances from the same JAR, each targeting a different
+# external system:
+#   - datasync-driver-csv  → writes sync-output.csv
+#   - datasync-driver-json → writes sync-output.json
+#
+# Prerequisites:
+#   1. DataSynchronizer's compose must be running (provides PostgreSQL + Kafka)
+#   2. Build the JAR first:  ./mvnw clean package -DskipTests
+#   3. Then:                 docker compose up --build
+# =============================================================================
+
+services:
+
+  # ---- CSV Driver (port 8081) ----
+  datasync-driver-csv:
+    build: .
+    container_name: datasync-driver-csv
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./output:/app/output
+    environment:
+      SERVER_PORT: 8081
+
+      # PostgreSQL — same DB as DataSynchronizer
+      SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/mydatabase
+      SPRING_DATASOURCE_USERNAME: myuser
+      SPRING_DATASOURCE_PASSWORD: secret
+
+      # Kafka
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: host.docker.internal:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: datasync-driver-csv
+
+      # DataSynchronizer REST endpoint
+      DRIVER_DATASYNCHRONIZER_BASE_URL: http://host.docker.internal:8080
+
+      # Activate CSV connector
+      DRIVER_CONNECTOR_TYPE: csv
+      DRIVER_CSV_OUTPUT_PATH: /app/output/sync-output.csv
+    depends_on:
+      datasync-driver-json:
+        condition: service_started
+        required: false
+
+  # ---- JSON Driver (port 8082) ----
+  datasync-driver-json:
+    build: .
+    container_name: datasync-driver-json
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./output:/app/output
+    environment:
+      SERVER_PORT: 8082
+
+      # PostgreSQL — same DB as DataSynchronizer
+      SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/mydatabase
+      SPRING_DATASOURCE_USERNAME: myuser
+      SPRING_DATASOURCE_PASSWORD: secret
+
+      # Kafka
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: host.docker.internal:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: datasync-driver-json
+
+      # DataSynchronizer REST endpoint
+      DRIVER_DATASYNCHRONIZER_BASE_URL: http://host.docker.internal:8080
+
+      # Activate JSON connector
+      DRIVER_CONNECTOR_TYPE: json
+      DRIVER_JSON_OUTPUT_PATH: /app/output/sync-output.json
+

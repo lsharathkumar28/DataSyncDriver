@@ -1,0 +1,25 @@
+
+# ---- Build output ----
+target/
+
+# ---- IDE files ----
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# ---- Connector output files ----
+sync-output.csv
+sync-output.json
+output/
+
+# ---- Old SQLite database (no longer used) ----
+*.db
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+
+# ---- Logs ----
+*.log
+
