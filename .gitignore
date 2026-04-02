@@ -16,6 +16,9 @@ output/
 # ---- Old SQLite database (no longer used) ----
 *.db
 
+# ---- Design docs (local only) ----
+DESIGN.md
+
 # ---- OS files ----
 .DS_Store
 Thumbs.db
