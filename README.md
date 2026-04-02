@@ -78,6 +78,16 @@ docker compose up --build
 
 They use separate Kafka consumer groups so both get all events independently.
 
+### Seed sample data and sync
+
+After the drivers are running, create sample users and trigger sync with:
+
+```bash
+./seed-and-sync.sh
+```
+
+This creates 3 users in the DataSynchronizer and triggers initial sync on both drivers. Output files will appear in the `output/` directory.
+
 ## Main API endpoints
 
 - `POST /api/v1/sync/initial` — trigger bulk sync
