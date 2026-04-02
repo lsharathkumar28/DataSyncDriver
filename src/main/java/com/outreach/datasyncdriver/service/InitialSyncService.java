@@ -9,6 +9,7 @@ import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,6 +54,8 @@ public class InitialSyncService {
             return 0;
         }
 
+        List<String> failedConnectors = new ArrayList<>();
+
         for (ExternalSystemConnector connector : connectors) {
             try {
                 String targetSystem = connector.targetSystemName();
@@ -81,7 +84,14 @@ public class InitialSyncService {
             } catch (Exception e) {
                 log.error("Initial load failed for connector [{}]: {}",
                         connector.name(), e.getMessage(), e);
+                failedConnectors.add(connector.name());
             }
+        }
+
+        if (!failedConnectors.isEmpty()) {
+            throw new RuntimeException(
+                    "Initial sync fetched " + users.size() + " user(s) but failed to write to connector(s): "
+                            + String.join(", ", failedConnectors));
         }
 
         return users.size();

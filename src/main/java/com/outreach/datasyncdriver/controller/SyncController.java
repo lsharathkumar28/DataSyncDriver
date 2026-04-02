@@ -24,12 +24,20 @@ public class SyncController {
     @Operation(summary = "Trigger initial sync",
                description = "Fetches all users from DataSynchronizer via REST and loads them into all registered connectors")
     @ApiResponse(responseCode = "200", description = "Initial sync completed")
+    @ApiResponse(responseCode = "500", description = "Initial sync failed — connector write error")
     public ResponseEntity<Map<String, Object>> triggerInitialSync() {
-        int count = initialSyncService.runInitialSync();
-        return ResponseEntity.ok(Map.of(
-                "status", "completed",
-                "usersSynchronized", count
-        ));
+        try {
+            int count = initialSyncService.runInitialSync();
+            return ResponseEntity.ok(Map.of(
+                    "status", "completed",
+                    "usersSynchronized", count
+            ));
+        } catch (RuntimeException e) {
+            return ResponseEntity.internalServerError().body(Map.of(
+                    "status", "failed",
+                    "error", e.getMessage()
+            ));
+        }
     }
 }
 
