@@ -1,125 +1,99 @@
 # DataSyncDriver
 
-A Spring Boot microservice that synchronizes user identity data from a central **DataSynchronizer** (identity vault) to external target systems via pluggable connectors.
+Synchronization driver that sits between our internal identity vault (DataSynchronizer) and external systems. It pulls user data via REST for bulk loads and listens to Kafka for real-time changes, then pushes everything through configurable schema mappings into target connectors.
 
-## What It Does
+Right now we have CSV and JSON file connectors, but the connector interface is generic enough to add LDAP, AD, database connectors etc. down the line.
 
-- **Bulk sync** — Pulls all users from the DataSynchronizer REST API and loads them into external systems
-- **Real-time sync** — Streams individual user changes via Apache Kafka as they happen
-- **Schema mapping** — Dynamically maps internal fields to target-system fields with transforms (`UPPER`, `LOWER`, `TRIM`) and defaults
-- **Sync rule filtering** — Controls which attributes flow through per connector, with direction and priority support
-- **Pluggable connectors** — CSV and JSON file connectors included; add new ones by implementing a single interface
+## How it works
 
-## Architecture
+1. **Initial sync** — hit `POST /api/v1/sync/initial` on the driver, it calls the DataSynchronizer's `/api/v1/users` endpoint, maps the fields, applies sync rules, and writes to the target system
+2. **Real-time sync** — DataSynchronizer publishes `UserChangeEvent` to a `user-events` Kafka topic whenever a user is created/updated/deleted. The driver consumes these and pushes changes to connectors automatically
+3. **Schema mapping** — field-level mapping with support for dot-notation (`attributes.department`), transforms (`UPPER`, `LOWER`, `TRIM`), and default values
+4. **Sync rules** — control which attributes are allowed/blocked per connector, per direction (inbound/outbound), with priority-based conflict resolution
 
-```
-DataSynchronizer (Identity Vault)          DataSyncDriver
-┌────────────────────────┐          ┌─────────────────────────┐
-│  REST: /api/v1/users   ├─ HTTP ──►  InitialSyncService     │
-│  Kafka: user-events    ├─ Event ─►  UserEventConsumer       │
-└────────────────────────┘          │         │                │
-                                    │   SchemaMapper           │
-                                    │   SyncRuleFilter         │
-                                    │         │                │
-                                    │   CsvConnector ──► .csv  │
-                                    │   JsonConnector ─► .json │
-                                    └─────────────────────────┘
-```
+## Tech stack
 
-## Tech Stack
+- Spring Boot 4.0.4 / Java 17
+- Apache Kafka (consumer + producer)
+- PostgreSQL (shared config DB across driver instances)
+- Caffeine cache (local, with Kafka-based cross-instance invalidation)
+- Spring Data JPA + Hibernate
+- Jackson 3 for JSON
+- SpringDoc OpenAPI (Swagger UI)
+- Docker Compose for running multiple driver instances
 
-| Technology | Purpose |
-|---|---|
-| Spring Boot 4.0.4 | Application framework |
-| Apache Kafka | Real-time event streaming + cross-instance cache invalidation |
-| PostgreSQL | Centralized configuration database (shared across instances) |
-| Spring Data JPA + Hibernate | ORM and auto DDL |
-| Caffeine | In-memory caching for configuration data |
-| Jackson 3 | JSON serialization |
-| SpringDoc OpenAPI | Swagger UI |
-| Docker Compose | Multi-driver deployment |
+## Getting started
 
-## Prerequisites
-
-- Java 17+
-- Docker Desktop
-
-## Quick Start
+You need Docker Desktop running for PostgreSQL and Kafka.
 
 ```bash
-# 1. Start infrastructure (PostgreSQL + Kafka)
-cd /path/to/DataSynchronizer
+# start postgres + kafka (from the DataSynchronizer project)
+cd ../DataSynchronizer
 docker compose up -d
 
-# 2. Start the DataSynchronizer
+# start the DataSynchronizer service
 ./mvnw spring-boot:run
 
-# 3. Start the DataSyncDriver
-cd /path/to/DataSyncDriver
+# come back here and start the driver
+cd ../DataSyncDriver
 ./mvnw clean spring-boot:run
+```
 
-# 4. Open Swagger UI
-open http://localhost:8081/swagger-ui.html
+Once it's up, Swagger UI is at http://localhost:8081/swagger-ui.html
 
-# 5. Create a user in DataSynchronizer
+### Try it out
+
+Create a user in the DataSynchronizer:
+```bash
 curl -X POST http://localhost:8080/api/v1/users \
   -H "Content-Type: application/json" \
   -d '{"name":"John Doe","firstName":"John","lastName":"Doe","emailId":"john@example.com","phoneNumber":"555-0101","attributes":{"department":"Engineering","title":"Developer"}}'
+```
 
-# 6. Trigger bulk sync
+Trigger bulk sync:
+```bash
 curl -X POST http://localhost:8081/api/v1/sync/initial
+```
 
-# 7. Check output
+Check the output:
+```bash
 cat sync-output.csv
 ```
 
-Any subsequent users created/updated/deleted in DataSynchronizer will automatically sync via Kafka in real time.
+After that, any new users you create/update/delete will sync automatically through Kafka — no need to call the initial sync again.
 
-## Running with Docker Compose (CSV + JSON drivers)
+## Running both CSV and JSON drivers (Docker Compose)
+
+We can run two instances of the driver from the same image, each configured for a different connector:
 
 ```bash
-# Build the JAR
 ./mvnw clean package -DskipTests
-
-# Start both drivers
 docker compose up --build
 ```
 
-This starts two driver instances from the same image:
-
-| Container | Port | Connector | Output |
-|---|---|---|---|
-| `datasync-driver-csv` | 8081 | CSV | `output/sync-output.csv` |
-| `datasync-driver-json` | 8082 | JSON | `output/sync-output.json` |
-
-Each has its own Kafka consumer group, so both receive all events independently.
-
-## API Endpoints
-
-### Sync
-| Method | Endpoint | Description |
+| Container | Port | What it does |
 |---|---|---|
-| `POST` | `/api/v1/sync/initial` | Trigger full bulk synchronization |
+| `datasync-driver-csv` | 8081 | Writes to `output/sync-output.csv` |
+| `datasync-driver-json` | 8082 | Writes to `output/sync-output.json` |
 
-### Configuration
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET/POST/PUT/DELETE` | `/api/v1/config/connections` | Manage connection configs |
-| `GET/POST/PUT/DELETE` | `/api/v1/config/mappings` | Manage schema mappings |
-| `GET/POST/PUT/DELETE` | `/api/v1/config/sync-rules` | Manage sync rules |
+They use separate Kafka consumer groups so both get all events independently.
 
-Full interactive API docs at **http://localhost:8081/swagger-ui.html**
+## Main API endpoints
 
-## Configuration
+- `POST /api/v1/sync/initial` — trigger bulk sync
+- `GET/POST/PUT/DELETE /api/v1/config/connections` — manage connection configs
+- `GET/POST/PUT/DELETE /api/v1/config/mappings` — manage schema mappings
+- `GET/POST/PUT/DELETE /api/v1/config/sync-rules` — manage sync rules
 
-Key properties in `application.properties`:
+## Config
+
+Important bits in `application.properties`:
 
 ```properties
-driver.connector.type=csv                          # Active connector: csv or json
-driver.datasynchronizer.base-url=http://localhost:8080  # DataSynchronizer URL
-driver.csv.output-path=sync-output.csv             # CSV output file
-driver.json.output-path=sync-output.json           # JSON output file
+driver.connector.type=csv                               # which connector to activate (csv / json)
+driver.datasynchronizer.base-url=http://localhost:8080   # where the identity vault lives
+driver.csv.output-path=sync-output.csv
+driver.json.output-path=sync-output.json
 ```
 
-See [DESIGN.md](DESIGN.md) for the full technical design document.
-
+For the full technical design (class descriptions, data flow diagrams, seed data details etc.), see [DESIGN.md](DESIGN.md).
