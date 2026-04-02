@@ -57,11 +57,9 @@ public class JsonFileConnector implements ExternalSystemConnector {
     @Override
     public void pushMappedChange(UserChangeEvent.ChangeType changeType, Map<String, Object> mappedData) {
         switch (changeType) {
-            case CREATED, UPDATED -> appendMappedRecord(mappedData);
-            case DELETED -> {
-                Object id = mappedData.values().stream().findFirst().orElse("unknown");
-                log.info("[JSON] DELETE id={} — logged (append-only file)", id);
-            }
+            case CREATED -> upsertMappedRecord(mappedData);
+            case UPDATED -> upsertMappedRecord(mappedData);
+            case DELETED -> deleteMappedRecord(mappedData);
         }
     }
 
@@ -95,8 +93,9 @@ public class JsonFileConnector implements ExternalSystemConnector {
     @Override
     public void pushChange(UserChangeEvent event) {
         switch (event.getChangeType()) {
-            case CREATED, UPDATED -> appendLegacyRecord(event);
-            case DELETED -> log.info("[JSON] DELETE userId={} — logged (append-only file)", event.getUserId());
+            case CREATED -> upsertLegacyRecord(event);
+            case UPDATED -> upsertLegacyRecord(event);
+            case DELETED -> deleteLegacyRecord(event);
         }
     }
 
@@ -117,35 +116,92 @@ public class JsonFileConnector implements ExternalSystemConnector {
     // ======================== Internal helpers ========================
 
     /**
-     * Reads the existing JSON array from the file, appends the new record,
-     * and rewrites the file. If the file doesn't exist or is empty, starts
-     * a new array.
+     * Finds the ID field name (first key) and its value from a mapped record.
      */
-    private void appendMappedRecord(Map<String, Object> mappedData) {
+    private String getIdFieldName(Map<String, Object> mappedData) {
+        return mappedData.keySet().iterator().next();
+    }
+
+    private String getIdValue(Map<String, Object> mappedData) {
+        return mappedData.values().stream().findFirst()
+                .map(Object::toString).orElse("");
+    }
+
+    /**
+     * Upsert a mapped record — if a record with the same ID exists, replace it.
+     * Otherwise append.
+     */
+    private void upsertMappedRecord(Map<String, Object> mappedData) {
         Path path = Path.of(outputPath);
         try {
+            String idField = getIdFieldName(mappedData);
+            String idValue = getIdValue(mappedData);
+
             List<Map<String, Object>> records = readExistingRecords(path);
-            records.add(new LinkedHashMap<>(mappedData));
+            boolean replaced = false;
 
-            String json = objectMapper.writerWithDefaultPrettyPrinter()
-                    .writeValueAsString(records);
-            Files.writeString(path, json);
+            for (int i = 0; i < records.size(); i++) {
+                Object existing = records.get(i).get(idField);
+                if (existing != null && existing.toString().equals(idValue)) {
+                    records.set(i, new LinkedHashMap<>(mappedData));
+                    replaced = true;
+                    break;
+                }
+            }
 
-            log.info("[JSON] Appended mapped record ({} fields), total {} records",
-                    mappedData.size(), records.size());
+            if (!replaced) {
+                records.add(new LinkedHashMap<>(mappedData));
+            }
+
+            Files.writeString(path, objectMapper.writerWithDefaultPrettyPrinter()
+                    .writeValueAsString(records));
+            log.info("[JSON] {} mapped record for {}={}, total {} records",
+                    replaced ? "Updated" : "Inserted", idField, idValue, records.size());
         } catch (IOException e) {
-            throw new RuntimeException("Failed to append mapped record to JSON", e);
+            throw new RuntimeException("Failed to upsert mapped record in JSON", e);
         }
     }
 
-    private void appendLegacyRecord(UserChangeEvent event) {
+    /**
+     * Delete a mapped record by matching the first field (ID).
+     */
+    private void deleteMappedRecord(Map<String, Object> mappedData) {
         Path path = Path.of(outputPath);
         try {
+            String idField = getIdFieldName(mappedData);
+            String idValue = getIdValue(mappedData);
+
             List<Map<String, Object>> records = readExistingRecords(path);
+            int sizeBefore = records.size();
+            records.removeIf(r -> {
+                Object existing = r.get(idField);
+                return existing != null && existing.toString().equals(idValue);
+            });
+
+            if (records.size() == sizeBefore) {
+                log.info("[JSON] DELETE {}={} — not found in file", idField, idValue);
+                return;
+            }
+
+            Files.writeString(path, objectMapper.writerWithDefaultPrettyPrinter()
+                    .writeValueAsString(records));
+            log.info("[JSON] Deleted mapped record for {}={}, total {} records",
+                    idField, idValue, records.size());
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to delete mapped record from JSON", e);
+        }
+    }
+
+    private void upsertLegacyRecord(UserChangeEvent event) {
+        Path path = Path.of(outputPath);
+        try {
+            String userId = event.getUserId() != null ? event.getUserId().toString() : null;
+
+            List<Map<String, Object>> records = readExistingRecords(path);
+            boolean replaced = false;
 
             LinkedHashMap<String, Object> record = new LinkedHashMap<>();
-            record.put("userId", event.getUserId() != null ? event.getUserId().toString() : null);
-            record.put("changeType", event.getChangeType().name());
+            record.put("userId", userId);
             record.put("name", event.getName());
             record.put("firstName", event.getFirstName());
             record.put("middleName", event.getMiddleName());
@@ -153,16 +209,52 @@ public class JsonFileConnector implements ExternalSystemConnector {
             record.put("emailId", event.getEmailId());
             record.put("phoneNumber", event.getPhoneNumber());
             record.put("attributes", event.getAttributes());
-            records.add(record);
 
-            String json = objectMapper.writerWithDefaultPrettyPrinter()
-                    .writeValueAsString(records);
-            Files.writeString(path, json);
+            for (int i = 0; i < records.size(); i++) {
+                Object existing = records.get(i).get("userId");
+                if (existing != null && existing.toString().equals(userId)) {
+                    records.set(i, record);
+                    replaced = true;
+                    break;
+                }
+            }
 
-            log.info("[JSON] Appended legacy {} for userId={}, total {} records",
-                    event.getChangeType(), event.getUserId(), records.size());
+            if (!replaced) {
+                records.add(record);
+            }
+
+            Files.writeString(path, objectMapper.writerWithDefaultPrettyPrinter()
+                    .writeValueAsString(records));
+            log.info("[JSON] {} legacy record for userId={}, total {} records",
+                    replaced ? "Updated" : "Inserted", userId, records.size());
         } catch (IOException e) {
-            throw new RuntimeException("Failed to append legacy record to JSON", e);
+            throw new RuntimeException("Failed to upsert legacy record in JSON", e);
+        }
+    }
+
+    private void deleteLegacyRecord(UserChangeEvent event) {
+        Path path = Path.of(outputPath);
+        try {
+            String userId = event.getUserId() != null ? event.getUserId().toString() : null;
+
+            List<Map<String, Object>> records = readExistingRecords(path);
+            int sizeBefore = records.size();
+            records.removeIf(r -> {
+                Object existing = r.get("userId");
+                return existing != null && existing.toString().equals(userId);
+            });
+
+            if (records.size() == sizeBefore) {
+                log.info("[JSON] DELETE userId={} — not found in file", userId);
+                return;
+            }
+
+            Files.writeString(path, objectMapper.writerWithDefaultPrettyPrinter()
+                    .writeValueAsString(records));
+            log.info("[JSON] Deleted legacy record for userId={}, total {} records",
+                    userId, records.size());
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to delete legacy record from JSON", e);
         }
     }
 

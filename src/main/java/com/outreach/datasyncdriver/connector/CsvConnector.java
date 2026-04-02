@@ -8,10 +8,12 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 import java.io.FileWriter;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -54,11 +56,9 @@ public class CsvConnector implements ExternalSystemConnector {
     @Override
     public void pushMappedChange(UserChangeEvent.ChangeType changeType, Map<String, Object> mappedData) {
         switch (changeType) {
-            case CREATED, UPDATED -> appendMappedRow(changeType, mappedData);
-            case DELETED -> {
-                Object id = mappedData.values().stream().findFirst().orElse("unknown");
-                log.info("[CSV] DELETE id={} — logged (append-only file)", id);
-            }
+            case CREATED -> upsertMappedRow(mappedData);
+            case UPDATED -> upsertMappedRow(mappedData);
+            case DELETED -> deleteMappedRow(mappedData);
         }
     }
 
@@ -88,8 +88,9 @@ public class CsvConnector implements ExternalSystemConnector {
     @Override
     public void pushChange(UserChangeEvent event) {
         switch (event.getChangeType()) {
-            case CREATED, UPDATED -> appendLegacyRow(event);
-            case DELETED -> log.info("[CSV] DELETE userId={} — logged (append-only file)", event.getUserId());
+            case CREATED -> upsertLegacyRow(event);
+            case UPDATED -> upsertLegacyRow(event);
+            case DELETED -> deleteLegacyRow(event);
         }
     }
 
@@ -117,47 +118,143 @@ public class CsvConnector implements ExternalSystemConnector {
 
     // ======================== Internal helpers ========================
 
-    private void appendMappedRow(UserChangeEvent.ChangeType changeType, Map<String, Object> mappedData) {
+    /**
+     * Upsert a mapped row — if a row with the same first-column value (ID) exists,
+     * replace it in place. Otherwise append a new row.
+     */
+    private void upsertMappedRow(Map<String, Object> mappedData) {
         Path path = Path.of(outputPath);
         try {
-            boolean needsHeader = !Files.exists(path) || Files.size(path) == 0;
-            try (PrintWriter pw = new PrintWriter(new FileWriter(path.toFile(), true))) {
-                if (needsHeader) {
-                    pw.println(String.join(",", mappedData.keySet()));
+            List<String> fieldNames = new ArrayList<>(mappedData.keySet());
+            String newRow = toCsvRow(fieldNames.stream()
+                    .map(f -> mappedData.get(f) != null ? mappedData.get(f).toString() : "")
+                    .toArray(String[]::new));
+
+            // ID is the first value in the map
+            String id = mappedData.values().stream().findFirst()
+                    .map(Object::toString).orElse("");
+
+            List<String> lines = readLinesOrEmpty(path);
+            boolean replaced = false;
+
+            for (int i = 1; i < lines.size(); i++) { // skip header
+                if (lines.get(i).startsWith(escapeCsv(id) + ",") || lines.get(i).startsWith(id + ",")) {
+                    lines.set(i, newRow);
+                    replaced = true;
+                    break;
                 }
-                String[] values = mappedData.values().stream()
-                        .map(v -> v != null ? v.toString() : "")
-                        .toArray(String[]::new);
-                pw.println(toCsvRow(values));
             }
-            log.info("[CSV] Appended mapped {} row ({} fields)", changeType, mappedData.size());
+
+            if (!replaced) {
+                if (lines.isEmpty()) {
+                    lines.add(String.join(",", fieldNames));
+                }
+                lines.add(newRow);
+            }
+
+            Files.writeString(path, String.join("\n", lines) + "\n");
+            log.info("[CSV] {} mapped row for id={}", replaced ? "Updated" : "Inserted", id);
         } catch (IOException e) {
-            throw new RuntimeException("Failed to append mapped row to CSV", e);
+            throw new RuntimeException("Failed to upsert mapped row to CSV", e);
         }
     }
 
-    private void appendLegacyRow(UserChangeEvent e) {
+    /**
+     * Delete a mapped row by matching the first-column value (ID).
+     */
+    private void deleteMappedRow(Map<String, Object> mappedData) {
         Path path = Path.of(outputPath);
         try {
-            boolean needsHeader = !Files.exists(path) || Files.size(path) == 0;
-            try (PrintWriter pw = new PrintWriter(new FileWriter(path.toFile(), true))) {
-                if (needsHeader) {
-                    pw.println(LEGACY_HEADER);
-                }
-                pw.println(toCsvRow(
-                        str(e.getUserId()),
-                        e.getName(),
-                        e.getFirstName(),
-                        e.getMiddleName(),
-                        e.getLastName(),
-                        e.getEmailId(),
-                        e.getPhoneNumber(),
-                        e.getAttributes() != null ? e.getAttributes().toString() : ""));
+            String id = mappedData.values().stream().findFirst()
+                    .map(Object::toString).orElse("");
+
+            List<String> lines = readLinesOrEmpty(path);
+            int sizeBefore = lines.size();
+            lines.removeIf(line -> line.startsWith(escapeCsv(id) + ",") || line.startsWith(id + ","));
+
+            // Don't remove the header
+            if (lines.isEmpty() || (sizeBefore > 1 && lines.size() == sizeBefore)) {
+                log.info("[CSV] DELETE id={} — not found in file", id);
+                return;
             }
-            log.info("[CSV] Appended legacy {} for userId={}", e.getChangeType(), e.getUserId());
-        } catch (IOException ex) {
-            throw new RuntimeException("Failed to append to CSV", ex);
+
+            Files.writeString(path, String.join("\n", lines) + "\n");
+            log.info("[CSV] Deleted mapped row for id={}", id);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to delete mapped row from CSV", e);
         }
+    }
+
+    private void upsertLegacyRow(UserChangeEvent e) {
+        Path path = Path.of(outputPath);
+        try {
+            String id = str(e.getUserId());
+            String newRow = toCsvRow(
+                    id,
+                    e.getName(),
+                    e.getFirstName(),
+                    e.getMiddleName(),
+                    e.getLastName(),
+                    e.getEmailId(),
+                    e.getPhoneNumber(),
+                    e.getAttributes() != null ? e.getAttributes().toString() : "");
+
+            List<String> lines = readLinesOrEmpty(path);
+            boolean replaced = false;
+
+            for (int i = 1; i < lines.size(); i++) {
+                if (lines.get(i).startsWith(escapeCsv(id) + ",") || lines.get(i).startsWith(id + ",")) {
+                    lines.set(i, newRow);
+                    replaced = true;
+                    break;
+                }
+            }
+
+            if (!replaced) {
+                if (lines.isEmpty()) {
+                    lines.add(LEGACY_HEADER);
+                }
+                lines.add(newRow);
+            }
+
+            Files.writeString(path, String.join("\n", lines) + "\n");
+            log.info("[CSV] {} legacy row for userId={}", replaced ? "Updated" : "Inserted", id);
+        } catch (IOException ex) {
+            throw new RuntimeException("Failed to upsert legacy row in CSV", ex);
+        }
+    }
+
+    private void deleteLegacyRow(UserChangeEvent e) {
+        Path path = Path.of(outputPath);
+        try {
+            String id = str(e.getUserId());
+            List<String> lines = readLinesOrEmpty(path);
+            int sizeBefore = lines.size();
+            lines.removeIf(line -> line.startsWith(escapeCsv(id) + ",") || line.startsWith(id + ","));
+
+            if (lines.size() == sizeBefore) {
+                log.info("[CSV] DELETE userId={} — not found in file", id);
+                return;
+            }
+
+            Files.writeString(path, String.join("\n", lines) + "\n");
+            log.info("[CSV] Deleted legacy row for userId={}", id);
+        } catch (IOException ex) {
+            throw new RuntimeException("Failed to delete legacy row from CSV", ex);
+        }
+    }
+
+    /**
+     * Read all lines from the CSV file, or return an empty mutable list
+     * if the file doesn't exist or is empty.
+     */
+    private List<String> readLinesOrEmpty(Path path) throws IOException {
+        if (Files.exists(path) && Files.size(path) > 0) {
+            return new ArrayList<>(Files.readAllLines(path).stream()
+                    .filter(line -> !line.isBlank())
+                    .toList());
+        }
+        return new ArrayList<>();
     }
 
     private String toCsvRow(String... fields) {
